@@ -1,0 +1,23 @@
+name: Powerwall evening export
+
+on:
+  schedule:
+    - cron: '0 21-23 * * *'   # ~2pm-4pm Pacific (DST-proof lower bound)
+    - cron: '0 0-6 * * *'     # through ~10pm Pacific in both PDT and PST
+  workflow_dispatch: {}        # manual run button
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python powerwall_evening_export.py
+        env:
+          TESLA_CLIENT_ID:      ${{ secrets.TESLA_CLIENT_ID }}
+          TESLA_REFRESH_TOKEN:  ${{ secrets.TESLA_REFRESH_TOKEN }}
+          TESLA_ENERGY_SITE_ID: ${{ secrets.TESLA_ENERGY_SITE_ID }}
+          GH_PAT:               ${{ secrets.GH_PAT }}
