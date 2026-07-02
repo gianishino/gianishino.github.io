@@ -12,10 +12,15 @@ Each run, the script:
         peak >= $0.40  -> keep 20%
         peak >= $0.20  -> keep 30%
         peak <  $0.20  -> OFF-SEASON, do nothing
-  5. At the peak hour: switch to Time-Based Control + Export Everything + that reserve,
-     so the Powerwall dumps to the grid during the single best-paid hour.
-  6. At RESTORE_HOUR: back to Self-Powered + Solar-only + small night reserve, so the
-     charge you kept powers the house overnight.
+  5. In the hour BEFORE the peak: switch to Time-Based Control + Export Everything +
+     that reserve. Triggering early absorbs two real-world lags -- GitHub's cron delay
+     (5-30 min at busy times) and the Powerwall's own ramp-up after a mode change (TBC
+     re-plans on its own schedule; it doesn't dump the instant settings land). The
+     peak-hour run re-sends the same commands as a free retry (idempotent).
+  6. At/after RESTORE_HOUR (plus an after-midnight catch-up run): back to Self-Powered +
+     Solar-only + small night reserve, so the charge you kept powers the house overnight.
+     The catch-up judges the season by YESTERDAY, so the last export day of the season
+     still gets restored even if the evening runs were dropped.
 
 Because a Powerwall 3 (11.5 kW) empties 100%->reserve in well under ~2 hours, the dump
 lands in basically one hourly price bucket -- so we target that single peak hour.
@@ -53,6 +58,7 @@ RESTORE_HOUR = int(os.environ.get("RESTORE_HOUR", "22"))            # switch bac
 NIGHT_RESERVE = int(os.environ.get("NIGHT_RESERVE", "5"))
 DAY_MODE = os.environ.get("DAY_MODE", "self_consumption")
 MIN_EXPORT_RATE = float(os.environ.get("MIN_EXPORT_RATE", "0.20"))  # below this, off-season -> skip
+EXPORT_LEAD_HOURS = int(os.environ.get("EXPORT_LEAD_HOURS", "1"))   # also trigger this many hours before the peak
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # Dynamic reserve tiers, checked high -> low: (min peak $/kWh, reserve % to KEEP)
@@ -68,6 +74,9 @@ def now_local():
     if td:
         y, m, d = map(int, td.split("-"))
         base = base.replace(year=y, month=m, day=d)
+    th = os.environ.get("TEST_HOUR")  # for dry-run testing of other hours
+    if th:
+        base = base.replace(hour=int(th))
     return base
 
 
@@ -167,6 +176,26 @@ def main():
     peak_hour, peak_rate = pick_peak(curve)
     print(f"{now.isoformat()} | {month} {daytype} | today's peak: {peak_hour}:00 @ ${peak_rate:.3f}/kWh")
 
+    # --- restore window (>= RESTORE_HOUR, plus the after-midnight catch-up run) ---
+    # Judged by the day the export could have happened: after midnight that's YESTERDAY.
+    # This way the season's last export day still gets restored, and in the off-season
+    # we never touch the battery (so manual app settings stick).
+    if now.hour >= RESTORE_HOUR or now.hour < 6:
+        ref_date = now.date() - datetime.timedelta(days=1) if now.hour < 6 else now.date()
+        if ref_date != now.date():
+            ref_curve, _, _ = todays_curve(ref_date)
+            _, ref_rate = pick_peak(ref_curve)
+        else:
+            ref_rate = peak_rate
+        if ref_rate < MIN_EXPORT_RATE:
+            print(f"Restore window, but ${ref_rate:.3f} peak means no export ran -> nothing to restore.")
+            return
+        if DRY_RUN:
+            print("DRY_RUN: would RESTORE now (Self-Powered + Solar-only).")
+            return
+        restore_phase(get_access_token())
+        return
+
     if peak_rate < MIN_EXPORT_RATE:
         print(f"Peak ${peak_rate:.3f} < MIN_EXPORT_RATE ${MIN_EXPORT_RATE:.2f} -> off-season, no action.")
         return
@@ -175,18 +204,19 @@ def main():
     if reserve is None:
         print(f"No reserve tier matches ${peak_rate:.3f} -> no action.")
         return
-    print(f"Plan: export at {peak_hour}:00 down to {reserve}% reserve; restore at {RESTORE_HOUR}:00.")
+    print(f"Plan: arm export from {peak_hour - EXPORT_LEAD_HOURS}:00 (peak {peak_hour}:00) "
+          f"down to {reserve}% reserve; restore at {RESTORE_HOUR}:00.")
 
-    if DRY_RUN:
-        print("DRY_RUN: no Tesla calls made.")
-        return
-
-    if now.hour == peak_hour:
+    # Arm in the hour before the peak (absorbs GitHub cron delay + Powerwall/TBC ramp-up);
+    # the peak-hour run re-sends the same idempotent commands as a retry.
+    if peak_hour - EXPORT_LEAD_HOURS <= now.hour <= peak_hour:
+        if DRY_RUN:
+            print("DRY_RUN: would EXPORT now (TBC + Export Everything).")
+            return
         export_phase(get_access_token(), reserve)
-    elif now.hour == RESTORE_HOUR:
-        restore_phase(get_access_token())
     else:
-        print(f"Hour {now.hour}: standing by (export at {peak_hour}, restore at {RESTORE_HOUR}).")
+        print(f"Hour {now.hour}: standing by (arm at {peak_hour - EXPORT_LEAD_HOURS}, "
+              f"restore at {RESTORE_HOUR}).")
 
 
 if __name__ == "__main__":
