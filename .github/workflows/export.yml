@@ -1,14 +1,33 @@
 name: Powerwall evening export
 
+# The script decides what to do from LOCAL (Pacific) time and your rate CSV, so we
+# just fire it once an hour across the afternoon/evening. Every run that isn't an
+# arm/peak/restore hour is a safe no-op. The UTC range below covers ~1pm-11pm Pacific
+# in BOTH PDT and PST, so it's DST-proof.
+#
+# Minute 40, NOT minute 0: GitHub delays (and sometimes drops) jobs scheduled at the
+# top of the hour, its busiest moment. An off-peak minute cuts typical delay a lot.
+# The script also arms the export in the hour BEFORE the peak, so even a 20-min delay
+# never eats into the paid window.
 on:
   schedule:
-    - cron: '0 21-23 * * *'   # ~2pm-4pm Pacific (DST-proof lower bound)
-    - cron: '0 0-6 * * *'     # through ~10pm Pacific in both PDT and PST
-  workflow_dispatch: {}        # manual run button
+    - cron: '40 20-23 * * *'  # ~1:40pm-4:40pm PDT / 12:40pm-3:40pm PST
+    - cron: '40 0-7 * * *'    # through ~11:40pm Pacific + an after-midnight catch-up
+  workflow_dispatch: {}        # manual run button (Actions tab)
+
+# Never let two runs overlap (protects the refresh-token rotation from races).
+concurrency:
+  group: powerwall-export
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # lets the keepalive step reset GitHub's 60-day scheduler timer
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,4 +39,20 @@ jobs:
           TESLA_CLIENT_ID:      ${{ secrets.TESLA_CLIENT_ID }}
           TESLA_REFRESH_TOKEN:  ${{ secrets.TESLA_REFRESH_TOKEN }}
           TESLA_ENERGY_SITE_ID: ${{ secrets.TESLA_ENERGY_SITE_ID }}
-          GH_PAT:               ${{ secrets.GH_PAT }}
+          GH_PAT:               ${{ secrets.GH_PAT }}   # optional: auto-saves a rotated token
+          # --- optional tuning (defaults shown in the script) ---
+          # RATE_CSV:          "data/export_rates.csv"
+          # MIN_EXPORT_RATE:   "0.20"   # below this, treat as off-season and do nothing
+          # NIGHT_RESERVE:     "5"
+          # RESTORE_HOUR:      "22"
+          # PEAK_WINDOW_START: "14"
+          # PEAK_WINDOW_END:   "20"
+          # EXPORT_LEAD_HOURS: "1"      # arm the export this many hours before the peak
+
+      # GitHub silently disables scheduled workflows in public repos after 60 days
+      # without repo activity. Re-enabling the workflow via the API resets that timer.
+      - name: Keepalive (reset 60-day scheduler timer)
+        if: always()
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/export.yml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}
