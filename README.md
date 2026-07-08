@@ -16,8 +16,12 @@ acts only then, through Tesla's official **Fleet API**, run by a free **GitHub A
 |---|---|---|
 | ≥ $0.80/kWh | **10%** (sell almost everything) | August |
 | ≥ $0.40/kWh | 20% | September |
-| ≥ $0.20/kWh | 30% | (none currently — shoulder days only) |
-| < $0.20/kWh | — **does nothing** (off-season) | Oct–July |
+| ≥ $0.20/kWh | 30% | July (weekdays) |
+| < $0.20/kWh | — **does nothing** (off-season) | Oct–June, July weekends |
+
+> Rates in `data/export_rates.csv` are the **total** export credit — Delivery EEC +
+> Generation EEC — from SCE's official EEC Factors file (PTO Group 3, 2025). Both
+> components are paid to bundled customers; never use a single component alone.
 
 **Timing:** it arms the export in the hour *before* the peak (`EXPORT_LEAD_HOURS`, default 1).
 This absorbs GitHub's cron delay (5–30 min at busy times) and the Powerwall's own ramp-up
