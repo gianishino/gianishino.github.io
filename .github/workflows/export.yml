@@ -13,7 +13,20 @@ on:
   schedule:
     - cron: '40 20-23 * * *'  # ~1:40pm-4:40pm PDT / 12:40pm-3:40pm PST
     - cron: '40 0-7 * * *'    # through ~11:40pm Pacific + an after-midnight catch-up
-  workflow_dispatch: {}        # manual run button (Actions tab)
+  workflow_dispatch:           # manual run button (Actions tab), with optional test knobs
+    inputs:
+      test_hour:
+        description: 'Pretend it is this local hour (0-23); e.g. 22 = harmless restore test'
+        required: false
+        default: ''
+      test_date:
+        description: 'Pretend date YYYY-MM-DD'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Set 1 to print the plan without calling Tesla'
+        required: false
+        default: ''
 
 # Never let two runs overlap (protects the refresh-token rotation from races).
 concurrency:
@@ -40,6 +53,9 @@ jobs:
           TESLA_REFRESH_TOKEN:  ${{ secrets.TESLA_REFRESH_TOKEN }}
           TESLA_ENERGY_SITE_ID: ${{ secrets.TESLA_ENERGY_SITE_ID }}
           GH_PAT:               ${{ secrets.GH_PAT }}   # optional: auto-saves a rotated token
+          TEST_HOUR:            ${{ inputs.test_hour }}
+          TEST_DATE:            ${{ inputs.test_date }}
+          DRY_RUN:              ${{ inputs.dry_run }}
           # --- optional tuning (defaults shown in the script) ---
           # RATE_CSV:          "data/export_rates.csv"
           # MIN_EXPORT_RATE:   "0.20"   # below this, treat as off-season and do nothing
