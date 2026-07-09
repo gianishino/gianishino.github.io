@@ -146,28 +146,97 @@ def maybe_update_refresh_secret(new_refresh):
 
 
 # ---- energy-site commands ----
-def _post(token, endpoint, payload):
+def _post(token, endpoint, payload, quiet=False):
     site_id = os.environ["TESLA_ENERGY_SITE_ID"]
     url = f"{API_BASE}/api/1/energy_sites/{site_id}/{endpoint}"
     r = requests.post(url, headers={"Authorization": f"Bearer {token}",
                                     "Content-Type": "application/json"}, json=payload, timeout=30)
-    print(f"POST {endpoint} {payload} -> {r.status_code} {r.text[:200]}")
+    shown = "(tariff json)" if quiet else payload
+    print(f"POST {endpoint} {shown} -> {r.status_code} {r.text[:200]}")
     r.raise_for_status()
     return r.json()
 
 
-def export_phase(token, reserve):
+# ---- tariff ("the tariff trick") ----
+# TBC decides WHETHER to export from the utility rate plan in the Tesla app, which is a
+# flat-ish approximation — so it often sees no hour worth dumping for. We push a real
+# tariff (today's actual NBT export credits) right before arming, so the optimizer
+# genuinely wants to sell at the peak. Restore pushes a sane static plan back.
+def _tariff(name, periods, buy_rates, sell_rates):
+    """periods: {NAME: [(fromHour, toHour), ...]}; rates: {NAME: $/kWh}"""
+    tou = {pname: {"periods": [
+                {"fromDayOfWeek": 0, "toDayOfWeek": 6,
+                 "fromHour": fh, "toHour": th, "fromMinute": 0, "toMinute": 0}
+                for fh, th in spans]}
+           for pname, spans in periods.items()}
+    seasons = {"Year": {"fromMonth": 1, "toMonth": 12, "fromDay": 1, "toDay": 31,
+                        "tou_periods": tou}}
+    def charges(rates):
+        return {"ALL": {"rates": {"ALL": 0}}, "Year": {"rates": rates}}
+    base = {
+        "version": 1, "utility": "Southern California Edison", "code": "SCE-NBT25-DYN",
+        "name": name, "currency": "USD",
+        "monthly_minimum_bill": 0, "min_applicable_demand": 0, "max_applicable_demand": 0,
+        "monthly_charges": 0, "daily_charges": [{"name": "Charge", "amount": 0}],
+        "daily_demand_charges": {},
+        "demand_charges": {"ALL": {"rates": {"ALL": 0}}, "Year": {"rates": {}}},
+        "energy_charges": charges(buy_rates), "seasons": seasons,
+    }
+    base["sell_tariff"] = {
+        "utility": "Southern California Edison", "code": "", "currency": "", "name": name,
+        "monthly_minimum_bill": 0, "min_applicable_demand": 0, "max_applicable_demand": 0,
+        "monthly_charges": 0, "daily_charges": [{"name": "Charge", "amount": 0}],
+        "daily_demand_charges": {},
+        "demand_charges": {"ALL": {"rates": {"ALL": 0}}, "Year": {"rates": {}}},
+        "energy_charges": charges(sell_rates), "seasons": seasons,
+    }
+    return base
+
+
+def export_tariff(curve, peak_hour):
+    """Today-specific tariff: real sell prices, peaked at today's best hour."""
+    arm = max(0, peak_hour - EXPORT_LEAD_HOURS)
+    end = min(23, peak_hour + 2)
+    peak_rate = curve[peak_hour]
+    shoulder_rate = curve.get(peak_hour - 1, peak_rate * 0.9)
+    periods = {"ON_PEAK": [(peak_hour, end)],
+               "SHOULDER": [(arm, peak_hour)],
+               "OFF_PEAK": [(0, arm), (end, 0)]}
+    # Tesla requires buy >= sell in every period.
+    buy = {"ON_PEAK": round(max(0.45, peak_rate), 5), "SHOULDER": round(max(0.45, shoulder_rate), 5),
+           "OFF_PEAK": 0.24}
+    sell = {"ON_PEAK": round(peak_rate, 5), "SHOULDER": round(shoulder_rate, 5), "OFF_PEAK": 0.05}
+    return _tariff("SCE NBT25 (export day)", periods, buy, sell)
+
+
+def standard_tariff():
+    """Static everyday plan: SCE TOU 4-9pm peak buy, realistic small sell credit."""
+    periods = {"ON_PEAK": [(16, 21)], "OFF_PEAK": [(0, 16), (21, 0)]}
+    return _tariff("SCE NBT25 (standard)", periods,
+                   {"ON_PEAK": 0.40, "OFF_PEAK": 0.24},
+                   {"ON_PEAK": 0.06, "OFF_PEAK": 0.05})
+
+
+def set_tariff(token, tariff):
+    _post(token, "time_of_use_settings", {"tou_settings": {"tariff_content_v2": tariff}},
+          quiet=True)
+    print(f"TARIFF set: {tariff['name']}.")
+
+
+def export_phase(token, reserve, curve, peak_hour):
+    set_tariff(token, export_tariff(curve, peak_hour))                    # make TBC WANT to sell
     _post(token, "operation", {"default_real_mode": "autonomous"})        # Time-Based Control
     _post(token, "grid_import_export", {"customer_preferred_export_rule": "battery_ok"})  # Export Everything
     _post(token, "backup", {"backup_reserve_percent": reserve})           # sell down to here
-    print(f"EXPORT done: TBC + Export Everything, reserve={reserve}%.")
+    print(f"EXPORT done: tariff + TBC + Export Everything, reserve={reserve}%.")
 
 
 def restore_phase(token):
     _post(token, "backup", {"backup_reserve_percent": NIGHT_RESERVE})
     _post(token, "grid_import_export", {"customer_preferred_export_rule": "pv_only"})
     _post(token, "operation", {"default_real_mode": DAY_MODE})
-    print(f"RESTORE done: {DAY_MODE} + Solar-only, reserve={NIGHT_RESERVE}%.")
+    set_tariff(token, standard_tariff())
+    print(f"RESTORE done: {DAY_MODE} + Solar-only, reserve={NIGHT_RESERVE}%, standard tariff.")
 
 
 def main():
@@ -211,9 +280,9 @@ def main():
     # the peak-hour run re-sends the same idempotent commands as a retry.
     if peak_hour - EXPORT_LEAD_HOURS <= now.hour <= peak_hour:
         if DRY_RUN:
-            print("DRY_RUN: would EXPORT now (TBC + Export Everything).")
+            print("DRY_RUN: would EXPORT now (tariff + TBC + Export Everything).")
             return
-        export_phase(get_access_token(), reserve)
+        export_phase(get_access_token(), reserve, curve, peak_hour)
     else:
         print(f"Hour {now.hour}: standing by (arm at {peak_hour - EXPORT_LEAD_HOURS}, "
               f"restore at {RESTORE_HOUR}).")
