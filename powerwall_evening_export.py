@@ -17,10 +17,12 @@ Each run, the script:
      (5-30 min at busy times) and the Powerwall's own ramp-up after a mode change (TBC
      re-plans on its own schedule; it doesn't dump the instant settings land). The
      peak-hour run re-sends the same commands as a free retry (idempotent).
-  6. At/after RESTORE_HOUR (plus an after-midnight catch-up run): back to Self-Powered +
-     Solar-only + small night reserve, so the charge you kept powers the house overnight.
-     The catch-up judges the season by YESTERDAY, so the last export day of the season
-     still gets restored even if the evening runs were dropped.
+  6. ~2 hours after the peak (when the dump is long done; RESTORE_HOUR is the upper
+     bound, plus an after-midnight catch-up run): back to Self-Powered + Solar-only +
+     small night reserve, so the charge you kept powers the house through the evening
+     and overnight instead of importing peak-priced grid power. The catch-up judges the
+     season by YESTERDAY, so the season's last export day still gets restored even if
+     the evening runs were dropped.
 
 Because a Powerwall 3 (11.5 kW) empties 100%->reserve in well under ~2 hours, the dump
 lands in basically one hourly price bucket -- so we target that single peak hour.
@@ -245,11 +247,14 @@ def main():
     peak_hour, peak_rate = pick_peak(curve)
     print(f"{now.isoformat()} | {month} {daytype} | today's peak: {peak_hour}:00 @ ${peak_rate:.3f}/kWh")
 
-    # --- restore window (>= RESTORE_HOUR, plus the after-midnight catch-up run) ---
+    # --- restore window (plus the after-midnight catch-up run) ---
+    # Dynamic: the dump is long done ~2h after the peak, so switch back then instead of
+    # holding TBC all evening (which made the house import peak-priced grid power while
+    # charge sat locked behind the export reserve). RESTORE_HOUR remains the upper bound.
     # Judged by the day the export could have happened: after midnight that's YESTERDAY.
-    # This way the season's last export day still gets restored, and in the off-season
-    # we never touch the battery (so manual app settings stick).
-    if now.hour >= RESTORE_HOUR or now.hour < 6:
+    # In the off-season we never touch the battery (so manual app settings stick).
+    restore_from = min(RESTORE_HOUR, peak_hour + 2)
+    if now.hour >= restore_from or now.hour < 6:
         ref_date = now.date() - datetime.timedelta(days=1) if now.hour < 6 else now.date()
         if ref_date != now.date():
             ref_curve, _, _ = todays_curve(ref_date)
@@ -274,7 +279,7 @@ def main():
         print(f"No reserve tier matches ${peak_rate:.3f} -> no action.")
         return
     print(f"Plan: arm export from {peak_hour - EXPORT_LEAD_HOURS}:00 (peak {peak_hour}:00) "
-          f"down to {reserve}% reserve; restore at {RESTORE_HOUR}:00.")
+          f"down to {reserve}% reserve; restore from {min(RESTORE_HOUR, peak_hour + 2)}:00.")
 
     # Arm in the hour before the peak (absorbs GitHub cron delay + Powerwall/TBC ramp-up);
     # the peak-hour run re-sends the same idempotent commands as a retry.
@@ -285,7 +290,7 @@ def main():
         export_phase(get_access_token(), reserve, curve, peak_hour)
     else:
         print(f"Hour {now.hour}: standing by (arm at {peak_hour - EXPORT_LEAD_HOURS}, "
-              f"restore at {RESTORE_HOUR}).")
+              f"restore from {min(RESTORE_HOUR, peak_hour + 2)}).")
 
 
 if __name__ == "__main__":
