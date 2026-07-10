@@ -39,6 +39,7 @@ Set DRY_RUN=1 (and optionally TEST_DATE=YYYY-MM-DD) to print the plan without ca
 import base64
 import csv
 import datetime
+import json
 import os
 import sys
 
@@ -251,6 +252,24 @@ def restore_phase(token):
     print(f"RESTORE done: {DAY_MODE} + Solar-only, reserve={NIGHT_RESERVE}%, standard tariff.")
 
 
+def energy_report(token, now, soc=None):
+    """Best-effort outcome line for the monthly performance review. Never fails the run."""
+    try:
+        site_id = os.environ["TESLA_ENERGY_SITE_ID"]
+        r = requests.get(f"{API_BASE}/api/1/energy_sites/{site_id}/calendar_history",
+                         params={"kind": "energy", "period": "day",
+                                 "end_date": now.isoformat(), "time_zone": LOCAL_TZ},
+                         headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        r.raise_for_status()
+        series = (r.json().get("response") or {}).get("time_series") or []
+        today = series[-1] if series else {}
+        exports = {k: v for k, v in today.items() if "export" in k}
+        out = {"date": str(now.date()), "soc_at_restore": soc, **exports}
+        print("RESULT " + json.dumps(out))
+    except Exception as e:
+        print(f"NOTE: energy report failed ({e}) -- restore unaffected.")
+
+
 def main():
     now = now_local()
     curve, month, daytype = todays_curve(now.date())
@@ -281,6 +300,7 @@ def main():
                   f"unconditional after).")
             return
         token = get_access_token()
+        soc = None
         if 6 <= now.hour < hard_restore:
             reserve = reserve_for(ref_rate) or NIGHT_RESERVE
             try:
@@ -294,6 +314,7 @@ def main():
                 return
             print(f"SOC {soc:.0f}% at reserve -> dump complete; restoring early.")
         restore_phase(token)
+        energy_report(token, now, soc)
         return
 
     if peak_rate < MIN_EXPORT_RATE:
