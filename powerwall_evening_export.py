@@ -17,10 +17,11 @@ Each run, the script:
      (5-30 min at busy times) and the Powerwall's own ramp-up after a mode change (TBC
      re-plans on its own schedule; it doesn't dump the instant settings land). The
      peak-hour run re-sends the same commands as a free retry (idempotent).
-  6. ~2 hours after the peak (when the dump is long done; RESTORE_HOUR is the upper
-     bound, plus an after-midnight catch-up run): back to Self-Powered + Solar-only +
-     small night reserve, so the charge you kept powers the house through the evening
-     and overnight instead of importing peak-priced grid power. The catch-up judges the
+  6. From 1 hour after the peak, each run checks the battery's charge: at the reserve
+     -> the dump is done -> restore immediately (Self-Powered + Solar-only + small night
+     reserve, so kept charge powers the house instead of importing peak-priced power).
+     Still above reserve -> dump ran late -> wait; peak+2 (capped by RESTORE_HOUR) is
+     the unconditional backstop, plus an after-midnight catch-up run that judges the
      season by YESTERDAY, so the season's last export day still gets restored even if
      the evening runs were dropped.
 
@@ -233,6 +234,15 @@ def export_phase(token, reserve, curve, peak_hour):
     print(f"EXPORT done: tariff + TBC + Export Everything, reserve={reserve}%.")
 
 
+def battery_soc(token):
+    """Current battery charge percentage, from the site's live status."""
+    site_id = os.environ["TESLA_ENERGY_SITE_ID"]
+    r = requests.get(f"{API_BASE}/api/1/energy_sites/{site_id}/live_status",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    r.raise_for_status()
+    return float(r.json()["response"]["percentage_charged"])
+
+
 def restore_phase(token):
     _post(token, "backup", {"backup_reserve_percent": NIGHT_RESERVE})
     _post(token, "grid_import_export", {"customer_preferred_export_rule": "pv_only"})
@@ -248,13 +258,15 @@ def main():
     print(f"{now.isoformat()} | {month} {daytype} | today's peak: {peak_hour}:00 @ ${peak_rate:.3f}/kWh")
 
     # --- restore window (plus the after-midnight catch-up run) ---
-    # Dynamic: the dump is long done ~2h after the peak, so switch back then instead of
-    # holding TBC all evening (which made the house import peak-priced grid power while
-    # charge sat locked behind the export reserve). RESTORE_HOUR remains the upper bound.
-    # Judged by the day the export could have happened: after midnight that's YESTERDAY.
-    # In the off-season we never touch the battery (so manual app settings stick).
-    restore_from = min(RESTORE_HOUR, peak_hour + 2)
-    if now.hour >= restore_from or now.hour < 6:
+    # SOC-aware: from 1h after the peak, each run checks the battery's charge. If it has
+    # reached the export reserve, the dump is done -> restore immediately (stops the house
+    # importing peak-priced grid power while charge sits locked). If it's still above
+    # (dump running or armed late), wait. From peak+2 (capped by RESTORE_HOUR) restore
+    # unconditionally. After midnight, season is judged by YESTERDAY. In the off-season
+    # we never touch the battery (so manual app settings stick).
+    soft_restore = min(RESTORE_HOUR, peak_hour + 1)
+    hard_restore = min(RESTORE_HOUR, peak_hour + 2)
+    if now.hour >= soft_restore or now.hour < 6:
         ref_date = now.date() - datetime.timedelta(days=1) if now.hour < 6 else now.date()
         if ref_date != now.date():
             ref_curve, _, _ = todays_curve(ref_date)
@@ -265,9 +277,23 @@ def main():
             print(f"Restore window, but ${ref_rate:.3f} peak means no export ran -> nothing to restore.")
             return
         if DRY_RUN:
-            print("DRY_RUN: would RESTORE now (Self-Powered + Solar-only).")
+            print(f"DRY_RUN: would RESTORE now (SOC-checked before {hard_restore}:00, "
+                  f"unconditional after).")
             return
-        restore_phase(get_access_token())
+        token = get_access_token()
+        if 6 <= now.hour < hard_restore:
+            reserve = reserve_for(ref_rate) or NIGHT_RESERVE
+            try:
+                soc = battery_soc(token)
+            except Exception as e:
+                print(f"SOC check failed ({e}) -> deferring restore to {hard_restore}:00.")
+                return
+            if soc > reserve + 3:
+                print(f"SOC {soc:.0f}% > reserve {reserve}%+3 -> dump not finished; "
+                      f"deferring restore (hard stop {hard_restore}:00).")
+                return
+            print(f"SOC {soc:.0f}% at reserve -> dump complete; restoring early.")
+        restore_phase(token)
         return
 
     if peak_rate < MIN_EXPORT_RATE:
@@ -279,7 +305,8 @@ def main():
         print(f"No reserve tier matches ${peak_rate:.3f} -> no action.")
         return
     print(f"Plan: arm export from {peak_hour - EXPORT_LEAD_HOURS}:00 (peak {peak_hour}:00) "
-          f"down to {reserve}% reserve; restore from {min(RESTORE_HOUR, peak_hour + 2)}:00.")
+          f"down to {reserve}% reserve; restore from {min(RESTORE_HOUR, peak_hour + 1)}:00 "
+          f"(SOC-checked; unconditional {min(RESTORE_HOUR, peak_hour + 2)}:00).")
 
     # Arm in the hour before the peak (absorbs GitHub cron delay + Powerwall/TBC ramp-up);
     # the peak-hour run re-sends the same idempotent commands as a retry.
@@ -290,7 +317,7 @@ def main():
         export_phase(get_access_token(), reserve, curve, peak_hour)
     else:
         print(f"Hour {now.hour}: standing by (arm at {peak_hour - EXPORT_LEAD_HOURS}, "
-              f"restore from {min(RESTORE_HOUR, peak_hour + 2)}).")
+              f"restore from {min(RESTORE_HOUR, peak_hour + 1)}).")
 
 
 if __name__ == "__main__":

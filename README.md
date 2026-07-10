@@ -28,11 +28,12 @@ This absorbs GitHub's cron delay (5–30 min at busy times) and the Powerwall's 
 after a mode change — TBC re-plans on its own schedule and doesn't dump the instant the
 settings land. The peak-hour run re-sends the same commands as a free retry.
 
-**~2 hours after the peak** (7:40pm on a 5pm-peak day; `RESTORE_HOUR`, default 10pm, is
-the upper bound) it switches back to Self-Powered so the charge you kept powers your
-house through the evening instead of importing peak-priced grid power — with an
-after-midnight catch-up run in case the evening runs get dropped. Every other moment it
-does nothing, so it's safe.
+**~1 hour after the peak** it starts checking the battery's charge each run: once the
+dump is complete (charge at the reserve floor) it switches back to Self-Powered — 6:40pm
+on a typical 5pm-peak day — so the charge you kept powers your house instead of
+importing peak-priced grid power. If the dump ran late it waits, with an unconditional
+backstop 2h after the peak (capped by `RESTORE_HOUR`) and an after-midnight catch-up run
+in case the evening runs get dropped. Every other moment it does nothing, so it's safe.
 
 ---
 
@@ -191,7 +192,7 @@ Edit the values (or add them as env overrides in `.github/workflows/export.yml`)
 | `RATE_CSV` | `data/export_rates.csv` | path to your locked export-rate schedule |
 | `MIN_EXPORT_RATE` | `0.20` | if today's peak is below this, do nothing (off-season) |
 | `NIGHT_RESERVE` | `5` | overnight floor — how far the house can draw the saved charge |
-| `RESTORE_HOUR` | `22` | LATEST hour to switch back; actual restore is ~2h after the peak |
+| `RESTORE_HOUR` | `22` | LATEST hour to switch back; actual restore is SOC-checked from peak+1 |
 | `PEAK_WINDOW_START` / `_END` | `14` / `20` | hours the peak is allowed to fall in |
 | `EXPORT_LEAD_HOURS` | `1` | arm the export this many hours before the peak (lag buffer) |
 | `DAY_MODE` | `self_consumption` | mode to return to (Self-Powered) |
