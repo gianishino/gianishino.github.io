@@ -65,6 +65,18 @@ MIN_EXPORT_RATE = float(os.environ.get("MIN_EXPORT_RATE", "0.20"))  # below this
 EXPORT_LEAD_HOURS = int(os.environ.get("EXPORT_LEAD_HOURS", "1"))   # also trigger this many hours before the peak
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 
+# Safety: pretend-clock test inputs force DRY_RUN unless explicitly overridden, so a
+# stray/malicious dispatch can't trigger a real export at a fake hour.
+_ALLOW_LIVE_TEST = os.environ.get("ALLOW_LIVE_TEST", "").lower() in ("1", "true", "yes")
+if (os.environ.get("TEST_HOUR") or os.environ.get("TEST_DATE")) and not DRY_RUN and not _ALLOW_LIVE_TEST:
+    print("NOTE: TEST_HOUR/TEST_DATE set without ALLOW_LIVE_TEST -> forcing DRY_RUN.")
+    DRY_RUN = True
+
+# Set to True if a rotated refresh token could not be saved back to the GitHub secret --
+# the run is then FAILED at the very end (after all battery commands) so GitHub emails
+# an alert the same day instead of the next Tesla call dying silently with a 401.
+ROTATION_SAVE_FAILED = False
+
 # Dynamic reserve tiers, checked high -> low: (min peak $/kWh, reserve % to KEEP)
 RESERVE_TIERS = [(0.80, 10), (0.40, 20), (0.20, 30)]
 
@@ -84,9 +96,37 @@ def now_local():
     return base
 
 
+def is_sce_holiday(date):
+    """SCE TOU holidays: New Year's, Presidents', Memorial, July 4, Labor, Veterans,
+    Thanksgiving, Christmas. A Sunday holiday is observed the following Monday; Saturday
+    holidays are NOT shifted. (SCE TOU rate fact sheets, verified 2026-07-10.)"""
+    y = date.year
+
+    def nth_weekday(month, weekday, n):
+        d = datetime.date(y, month, 1)
+        return d + datetime.timedelta(days=(weekday - d.weekday()) % 7 + (n - 1) * 7)
+
+    def last_monday(month):
+        d = datetime.date(y, month, 28) + datetime.timedelta(days=4)
+        d = d.replace(day=1) - datetime.timedelta(days=1)  # last day of `month`
+        return d - datetime.timedelta(days=d.weekday())
+
+    fixed = [datetime.date(y, 1, 1), datetime.date(y, 7, 4),
+             datetime.date(y, 11, 11), datetime.date(y, 12, 25)]
+    days = set(fixed)
+    for f in fixed:
+        if f.weekday() == 6:  # Sunday -> following Monday observed
+            days.add(f + datetime.timedelta(days=1))
+    days |= {nth_weekday(2, 0, 3),   # Presidents' Day
+             last_monday(5),         # Memorial Day
+             nth_weekday(9, 0, 1),   # Labor Day
+             nth_weekday(11, 3, 4)}  # Thanksgiving
+    return date in days
+
+
 def todays_curve(date):
     month = date.strftime("%b")  # 'Jan'..'Dec'
-    daytype = "Weekday" if date.weekday() < 5 else "Weekend/Holiday"
+    daytype = "Weekend/Holiday" if (date.weekday() >= 5 or is_sce_holiday(date)) else "Weekday"
     curve = {}
     with open(RATE_CSV, newline="") as f:
         for r in csv.DictReader(f):
@@ -129,24 +169,28 @@ def get_access_token():
 
 
 def maybe_update_refresh_secret(new_refresh):
+    global ROTATION_SAVE_FAILED
     pat = os.environ.get("GH_PAT")
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not (pat and repo):
-        print("NOTE: refresh token rotated; set GH_PAT to auto-save it, else re-run the auth helper if runs fail.")
+        ROTATION_SAVE_FAILED = True
+        print("WARNING: refresh token rotated but GH_PAT/GITHUB_REPOSITORY missing -> rotation NOT saved.")
         return
     try:
         from nacl import encoding, public
-    except ImportError:
-        print("NOTE: pynacl not installed; cannot auto-update the secret.")
-        return
-    headers = {"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"}
-    key = requests.get(f"https://api.github.com/repos/{repo}/actions/secrets/public-key",
-                       headers=headers, timeout=30).json()
-    pk = public.PublicKey(key["key"].encode(), encoding.Base64Encoder())
-    sealed = base64.b64encode(public.SealedBox(pk).encrypt(new_refresh.encode())).decode()
-    r = requests.put(f"https://api.github.com/repos/{repo}/actions/secrets/TESLA_REFRESH_TOKEN",
-                     headers=headers, json={"encrypted_value": sealed, "key_id": key["key_id"]}, timeout=30)
-    print(f"Updated TESLA_REFRESH_TOKEN secret -> HTTP {r.status_code}")
+        headers = {"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"}
+        key = requests.get(f"https://api.github.com/repos/{repo}/actions/secrets/public-key",
+                           headers=headers, timeout=30).json()
+        pk = public.PublicKey(key["key"].encode(), encoding.Base64Encoder())
+        sealed = base64.b64encode(public.SealedBox(pk).encrypt(new_refresh.encode())).decode()
+        r = requests.put(f"https://api.github.com/repos/{repo}/actions/secrets/TESLA_REFRESH_TOKEN",
+                         headers=headers, json={"encrypted_value": sealed, "key_id": key["key_id"]}, timeout=30)
+        print(f"Updated TESLA_REFRESH_TOKEN secret -> HTTP {r.status_code}")
+        if r.status_code not in (201, 204):
+            ROTATION_SAVE_FAILED = True
+    except Exception as e:
+        ROTATION_SAVE_FAILED = True
+        print(f"WARNING: could not save rotated refresh token ({e}).")
 
 
 # ---- energy-site commands ----
@@ -228,10 +272,12 @@ def set_tariff(token, tariff):
 
 
 def export_phase(token, reserve, curve, peak_hour):
+    # Order matters: set the reserve floor BEFORE enabling battery export, so a partial
+    # failure can only UNDER-export -- it can never sell the backup cushion.
     set_tariff(token, export_tariff(curve, peak_hour))                    # make TBC WANT to sell
+    _post(token, "backup", {"backup_reserve_percent": reserve})           # floor first
     _post(token, "operation", {"default_real_mode": "autonomous"})        # Time-Based Control
-    _post(token, "grid_import_export", {"customer_preferred_export_rule": "battery_ok"})  # Export Everything
-    _post(token, "backup", {"backup_reserve_percent": reserve})           # sell down to here
+    _post(token, "grid_import_export", {"customer_preferred_export_rule": "battery_ok"})  # export last
     print(f"EXPORT done: tariff + TBC + Export Everything, reserve={reserve}%.")
 
 
@@ -244,16 +290,30 @@ def battery_soc(token):
     return float(r.json()["response"]["percentage_charged"])
 
 
+def site_settings(token):
+    """Current (mode, export_rule) from site_info; used to skip redundant restores and
+    to reconcile a missed season-end restore."""
+    site_id = os.environ["TESLA_ENERGY_SITE_ID"]
+    r = requests.get(f"{API_BASE}/api/1/energy_sites/{site_id}/site_info",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    r.raise_for_status()
+    d = r.json()["response"]
+    return d.get("default_real_mode"), (d.get("components") or {}).get("customer_preferred_export_rule")
+
+
 def restore_phase(token):
-    _post(token, "backup", {"backup_reserve_percent": NIGHT_RESERVE})
+    # Mirror-safe order: disable battery export FIRST, then mode, then lower the reserve.
     _post(token, "grid_import_export", {"customer_preferred_export_rule": "pv_only"})
     _post(token, "operation", {"default_real_mode": DAY_MODE})
+    _post(token, "backup", {"backup_reserve_percent": NIGHT_RESERVE})
     set_tariff(token, standard_tariff())
     print(f"RESTORE done: {DAY_MODE} + Solar-only, reserve={NIGHT_RESERVE}%, standard tariff.")
 
 
-def energy_report(token, now, soc=None):
-    """Best-effort outcome line for the monthly performance review. Never fails the run."""
+def energy_report(token, now, soc=None, report_date=None):
+    """Best-effort outcome line for the monthly performance review. Never fails the run.
+    report_date = the day the export actually happened (differs from now.date() when the
+    after-midnight catch-up run does the restoring)."""
     try:
         site_id = os.environ["TESLA_ENERGY_SITE_ID"]
         r = requests.get(f"{API_BASE}/api/1/energy_sites/{site_id}/calendar_history",
@@ -264,7 +324,7 @@ def energy_report(token, now, soc=None):
         series = (r.json().get("response") or {}).get("time_series") or []
         today = series[-1] if series else {}
         exports = {k: v for k, v in today.items() if "export" in k}
-        out = {"date": str(now.date()), "soc_at_restore": soc, **exports}
+        out = {"date": str(report_date or now.date()), "soc_at_restore": soc, **exports}
         print("RESULT " + json.dumps(out))
     except Exception as e:
         print(f"NOTE: energy report failed ({e}) -- restore unaffected.")
@@ -275,6 +335,29 @@ def main():
     curve, month, daytype = todays_curve(now.date())
     peak_hour, peak_rate = pick_peak(curve)
     print(f"{now.isoformat()} | {month} {daytype} | today's peak: {peak_hour}:00 @ ${peak_rate:.3f}/kWh")
+
+    # --- monthly maintenance (1st of the month, after-midnight run, ALL year) ---
+    # 1) Token keepalive: Tesla kills refresh tokens after ~3 months unused; the export
+    #    season leaves a 9-month gap, so we authenticate (rotate + save) monthly.
+    # 2) Reconcile: if a season-end restore was missed, the battery would sit in
+    #    export-day settings all winter -- detect and repair it here.
+    if now.day == 1 and now.hour < 6:
+        if DRY_RUN:
+            print("DRY_RUN: would do monthly token keepalive + settings reconcile.")
+            return
+        token = get_access_token()  # the keepalive: uses, rotates, and saves the token
+        try:
+            mode, rule = site_settings(token)
+        except Exception as e:
+            print(f"NOTE: settings read failed ({e}); keepalive done, reconcile skipped.")
+            return
+        if mode == "autonomous" or rule == "battery_ok":
+            print(f"Reconcile: export-day settings found off-schedule (mode={mode}, "
+                  f"rule={rule}) -> restoring.")
+            restore_phase(token)
+        else:
+            print(f"Monthly keepalive OK (mode={mode}, rule={rule}); token rotated & saved.")
+        return
 
     # --- restore window (plus the after-midnight catch-up run) ---
     # SOC-aware: from 1h after the peak, each run checks the battery's charge. If it has
@@ -300,6 +383,13 @@ def main():
                   f"unconditional after).")
             return
         token = get_access_token()
+        try:
+            mode, rule = site_settings(token)
+            if mode == DAY_MODE and rule == "pv_only":
+                print("Already restored (Self-Powered + Solar-only) -> no action.")
+                return
+        except Exception as e:
+            print(f"NOTE: settings read failed ({e}); proceeding with restore.")
         soc = None
         if 6 <= now.hour < hard_restore:
             reserve = reserve_for(ref_rate) or NIGHT_RESERVE
@@ -314,7 +404,7 @@ def main():
                 return
             print(f"SOC {soc:.0f}% at reserve -> dump complete; restoring early.")
         restore_phase(token)
-        energy_report(token, now, soc)
+        energy_report(token, now, soc, report_date=ref_date)
         return
 
     if peak_rate < MIN_EXPORT_RATE:
@@ -343,3 +433,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    if ROTATION_SAVE_FAILED:
+        print("FATAL: rotated Tesla refresh token was NOT saved to the GitHub secret. "
+              "The next Tesla call will 401. Fix GH_PAT / update TESLA_REFRESH_TOKEN now.")
+        sys.exit(1)
