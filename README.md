@@ -14,8 +14,8 @@ acts only then, through Tesla's official **Fleet API**, run by a free **GitHub A
 
 | Today's peak export rate | Reserve kept | Typical month |
 |---|---|---|
-| ≥ $0.80/kWh | **10%** (sell almost everything) | August |
-| ≥ $0.40/kWh | 20% | September |
+| ≥ $0.80/kWh | **5%** (sell everything above the night floor) | August |
+| ≥ $0.40/kWh | 5% | September |
 | ≥ $0.20/kWh | 30% | July (weekdays) |
 | < $0.20/kWh | — **does nothing** (off-season) | Oct–June, July weekends |
 
