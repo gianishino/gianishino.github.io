@@ -8,8 +8,8 @@ Each run, the script:
   3. Finds the single HIGHEST export hour in the afternoon/evening window (the "peak").
   4. Picks a backup reserve based on how high that peak is (dynamic / aggressive when
      rates are huge, e.g. August):
-        peak >= $0.80  -> keep only 10%   (sell almost everything)
-        peak >= $0.40  -> keep 20%
+        peak >= $0.80  -> keep only 5%    (sell everything; night floor anyway)
+        peak >= $0.40  -> keep 5%
         peak >= $0.20  -> keep 30%
         peak <  $0.20  -> OFF-SEASON, do nothing
   5. In the hour BEFORE the peak: switch to Time-Based Control + Export Everything +
@@ -78,7 +78,11 @@ if (os.environ.get("TEST_HOUR") or os.environ.get("TEST_DATE")) and not DRY_RUN 
 ROTATION_SAVE_FAILED = False
 
 # Dynamic reserve tiers, checked high -> low: (min peak $/kWh, reserve % to KEEP)
-RESERVE_TIERS = [(0.80, 10), (0.40, 20), (0.20, 30)]
+RESERVE_TIERS = [(0.80, 5), (0.40, 5), (0.20, 30)]
+# 2026-08-09: Aug/Sep tiers lowered 10/20 -> 5 (= NIGHT_RESERVE). Battery reaches 5%
+# nightly on export days regardless, so dumping to 5% adds ~0 degradation while
+# capturing the export-vs-avoided-retail spread on the freed kWh (~$15 Aug + ~$14 Sep).
+# July stays 30%: at $0.284 the spread vs ~$0.35 avoided evening retail is negative.
 
 AUTH_URL = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
 
